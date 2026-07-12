@@ -73,7 +73,16 @@ pub trait Editor: Send {
     //       and API agnostic, add a way to ask the GuiContext if the wrapper already provides a
     //       tick function. If it does not, then the Editor implementation must handle this by
     //       itself. This would also need an associated `PREFERRED_FRAME_RATE` constant.
-    // TODO: Host->Plugin resizing
+
+    /// Called by a wrapper when the *outer* (host- or OS-owned) window has been resized by the user
+    /// to `(physical_width, physical_height)` physical pixels. The editor should rescale its
+    /// contents to fit that box and return `true` if it handled the resize.
+    ///
+    /// The default implementation returns `false` (not handled), so editors that don't support
+    /// host-driven resizing are unaffected and the wrapper can fall back to its previous behavior.
+    fn host_resized(&self, _physical_width: u32, _physical_height: u32) -> bool {
+        false
+    }
 }
 
 /// A raw window handle for platform and GUI framework agnostic editors. This implements

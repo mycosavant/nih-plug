@@ -5,7 +5,7 @@ use crossbeam::atomic::AtomicCell;
 use nih_plug::debug::*;
 use nih_plug::prelude::{Editor, GuiContext, ParentWindowHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use vizia::context::backend::TextConfig;
 use vizia::prelude::*;
 
@@ -30,6 +30,20 @@ pub(crate) struct ViziaEditor {
     /// to compute a property in an event handler. Like when positioning an element based on the
     /// display value's width.
     pub(crate) emit_parameters_changed_event: Arc<AtomicBool>,
+
+    /// A cross-thread handle into the running vizia context, captured once when the editor is
+    /// spawned. This is used by [`Editor::host_resized()`] to push a host-driven resize onto the GUI
+    /// thread as a `user_scale_factor` change. It is `None` until the editor is open.
+    pub(crate) resize_proxy: Arc<Mutex<Option<ContextProxy>>>,
+}
+
+/// Emitted onto the GUI thread by [`ViziaEditor::host_resized()`] and handled by
+/// [`WindowModel`][crate::widgets::WindowModel]. Applying the new scale factor mirrors exactly what
+/// the [`ResizeHandle`][crate::widgets::ResizeHandle] does, so the rest of the resize plumbing is
+/// reused unchanged.
+pub(crate) struct HostResizeEvent {
+    /// The new uniform user scale factor computed from the host-provided outer window size.
+    pub new_user_scale_factor: f64,
 }
 
 impl Editor for ViziaEditor {
@@ -41,6 +55,7 @@ impl Editor for ViziaEditor {
         let app = self.app.clone();
         let vizia_state = self.vizia_state.clone();
         let theming = self.theming;
+        let resize_proxy = self.resize_proxy.clone();
 
         let (unscaled_width, unscaled_height) = vizia_state.inner_logical_size();
         let system_scaling_factor = self.scaling_factor.load();
@@ -78,6 +93,12 @@ impl Editor for ViziaEditor {
                 )),
             }
             .build(cx);
+
+            // Capture a cross-thread proxy so the wrapper can push host-driven resizes onto the GUI
+            // thread. See `ViziaEditor::host_resized()`.
+            if let Ok(mut slot) = resize_proxy.lock() {
+                *slot = Some(cx.get_proxy());
+            }
 
             app(cx, context.clone())
         })
@@ -118,6 +139,7 @@ impl Editor for ViziaEditor {
         Box::new(ViziaEditorHandle {
             vizia_state: self.vizia_state.clone(),
             window,
+            resize_proxy: self.resize_proxy.clone(),
         })
     }
 
@@ -157,12 +179,42 @@ impl Editor for ViziaEditor {
         self.emit_parameters_changed_event
             .store(true, Ordering::Relaxed);
     }
+
+    fn host_resized(&self, physical_width: u32, physical_height: u32) -> bool {
+        let (logical_width, logical_height) = self.vizia_state.inner_logical_size();
+        if logical_width == 0 || logical_height == 0 {
+            return false;
+        }
+
+        // Divide out any HiDPI scaling the host applies so we compute the *user* scale factor, then
+        // fit the content into the new box while preserving its aspect ratio. Clamping to a sensible
+        // minimum prevents the GUI from becoming unusably small.
+        let dpi_factor = self.scaling_factor.load().unwrap_or(1.0) as f64;
+        let new_scale = ((physical_width as f64 / dpi_factor) / logical_width as f64)
+            .min((physical_height as f64 / dpi_factor) / logical_height as f64)
+            .max(0.5);
+
+        match self.resize_proxy.lock() {
+            Ok(mut slot) => match slot.as_mut() {
+                Some(proxy) => proxy
+                    .emit(HostResizeEvent {
+                        new_user_scale_factor: new_scale,
+                    })
+                    .is_ok(),
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
 }
 
 /// The window handle used for [`ViziaEditor`].
 struct ViziaEditorHandle {
     vizia_state: Arc<ViziaState>,
     window: WindowHandle,
+    /// The editor's cross-thread resize proxy, cleared when this handle is dropped since the proxy
+    /// is tied to the window's event loop.
+    resize_proxy: Arc<Mutex<Option<ContextProxy>>>,
 }
 
 /// The window handle enum stored within 'WindowHandle' contains raw pointers. Is there a way around
@@ -172,6 +224,13 @@ unsafe impl Send for ViziaEditorHandle {}
 impl Drop for ViziaEditorHandle {
     fn drop(&mut self) {
         self.vizia_state.open.store(false, Ordering::Release);
+
+        // The proxy points into the event loop of the window that is about to be closed, so it must
+        // not outlive it
+        if let Ok(mut resize_proxy) = self.resize_proxy.lock() {
+            *resize_proxy = None;
+        }
+
         // XXX: This should automatically happen when the handle gets dropped, but apparently not
         self.window.close();
     }

@@ -121,6 +121,15 @@ struct WrapperWindowHandler {
     /// This is used to communicate with the wrapper from the audio thread and from within the
     /// baseview window handler on the GUI thread.
     gui_task_receiver: channel::Receiver<GuiTask>,
+
+    /// The plugin's editor, so we can forward host/OS-driven outer window resizes to it through
+    /// [`Editor::host_resized()`].
+    editor: Arc<Mutex<Box<dyn Editor>>>,
+
+    /// The last outer physical size we forwarded to the editor. Used to suppress the resize feedback
+    /// loop: the editor's rescale re-drives `request_resize`, which emits another `Resized` event
+    /// for the size we just caused.
+    last_forwarded_size: (u32, u32),
 }
 
 /// A message sent to the GUI thread.
@@ -146,7 +155,25 @@ impl WindowHandler for WrapperWindowHandler {
         }
     }
 
-    fn on_event(&mut self, _window: &mut Window, _event: baseview::Event) -> EventStatus {
+    fn on_event(&mut self, _window: &mut Window, event: baseview::Event) -> EventStatus {
+        // When the user resizes the outer OS window, forward the new physical size to the editor so
+        // it can rescale its contents to fit. Without this the child window keeps its original size
+        // and the newly exposed area is left unpainted.
+        if let baseview::Event::Window(baseview::WindowEvent::Resized(window_info)) = event {
+            let physical_size = window_info.physical_size();
+            let new_size = (physical_size.width, physical_size.height);
+            if new_size != self.last_forwarded_size {
+                self.last_forwarded_size = new_size;
+                if self
+                    .editor
+                    .lock()
+                    .host_resized(physical_size.width, physical_size.height)
+                {
+                    return EventStatus::Captured;
+                }
+            }
+        }
+
         EventStatus::Ignored
     }
 }
@@ -334,6 +361,23 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 };
 
                 let (width, height) = editor.lock().size();
+
+                // `WindowEvent::Resized` reports physical pixels, so the forwarding guard must be
+                // seeded with the physical size of the window being opened rather than the logical
+                // editor size, or the first resize event would spuriously pass the guard when a DPI
+                // scale is in effect.
+                #[cfg(not(target_os = "macos"))]
+                let initial_physical_size = (
+                    (width as f64 * self.config.dpi_scale as f64).round() as u32,
+                    (height as f64 * self.config.dpi_scale as f64).round() as u32,
+                );
+                // On macOS scaling is handled by the OS and the factor isn't known until the window
+                // is open, so the logical size is the best available seed. A spurious first forward
+                // is harmless: it resolves to the current scale factor, which the editor treats as
+                // a no-op.
+                #[cfg(target_os = "macos")]
+                let initial_physical_size = (width, height);
+
                 Window::open_blocking(
                     WindowOpenOptions {
                         title: String::from(P::NAME),
@@ -370,6 +414,8 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                         WrapperWindowHandler {
                             _editor_handle: editor_handle,
                             gui_task_receiver,
+                            editor: editor.clone(),
+                            last_forwarded_size: initial_physical_size,
                         }
                     },
                 )

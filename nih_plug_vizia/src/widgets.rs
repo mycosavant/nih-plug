@@ -157,6 +157,18 @@ impl Model for WindowModel {
             }
         });
 
+        // A host-driven resize arrives here (`ViziaEditor::host_resized()` -> `proxy.emit()`).
+        // Applying it as a user scale factor is exactly what the `ResizeHandle` grip does, so the
+        // rest of the resize plumbing (`GeometryChanged` -> `request_resize` -> `window.resize`)
+        // reuses the existing path below.
+        event.map(|resize_event, meta| {
+            let crate::editor::HostResizeEvent {
+                new_user_scale_factor,
+            } = resize_event;
+            cx.set_user_scale_factor(*new_user_scale_factor);
+            meta.consume();
+        });
+
         // This gets fired whenever the inner window gets resized
         event.map(|window_event, _| {
             if let WindowEvent::GeometryChanged { .. } = window_event {
